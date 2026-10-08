@@ -21,7 +21,9 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace
 {
@@ -47,22 +49,31 @@ namespace
     using BuildMotionNameFn = void* (*)(void* model, void* out, const char* motion);
     BuildMotionNameFn g_originalBuildMotionName = nullptr;
 
-    // Field motions the CFieldPlayer requests -> battle motions every Digimon has
-    // (fn = idle, fw = walk, fr = run, ff01/ff02 = alternate idle/move mode).
+    // Archive_FileExists(const char* name, const char* ext, const char* archive) -> bool
+    //   archive == nullptr checks every registered archive, mod folders included.
+    constexpr const char* SIG_FILE_EXISTS =
+        "49 8B D8 4C 8B FA 4C 8B F1 80 3D ?? ?? ?? ?? 00 75 05 E8 ?? ?? ?? ?? 45 33 E4 44 89 65 C7";
+    constexpr int SIG_FILE_EXISTS_OFFSET = -0x2D;
+    using FileExistsFn                   = bool (*)(const char* name, const char* ext, const char* archive);
+    FileExistsFn g_fileExists            = nullptr;
+
+    // Field motions the CFieldPlayer requests -> battle motions most Digimon have
+    // (fn = idle, fw = walk, fr = run, ff01/ff02 = alternate idle/move mode). Any other
+    // missing motion (cutscene pc motions) falls back to the battle idle.
     struct MotionFallback
     {
         const char* field;
         const char* battle;
-        const char* nativeModels; // models that ship the field motion (from DSDB/DSDBP)
     };
     constexpr MotionFallback MOTION_FALLBACKS[] = {
-        { "fn01", "bn01", "chr320 chr781 chr783 chr805 chr811 chr816 chr999" },
-        { "fw01", "br01", "chr320 chr805" },
-        { "fr01", "br01", "chr320 chr805" },
-        { "ff01", "bn01", "" },
-        { "ff02", "br01", "" },
+        { "fn01", "bn01" }, { "fw01", "br01" }, { "fr01", "br01" }, { "ff01", "bn01" }, { "ff02", "br01" },
     };
+    constexpr const char* IDLE_FALLBACK = "bn01";
     std::atomic<bool> g_remapMotions{ true };
+
+    // "<model>_<motion>" -> exists; filled lazily (key includes the model, so no reset needed).
+    std::mutex g_existsMutex;
+    std::unordered_map<std::string, bool> g_existsCache;
 
     using GetControlModelNameFn = const char* (*)(void* player, void* unused);
     GetControlModelNameFn g_original = nullptr;
@@ -104,23 +115,40 @@ namespace
         return g_original(player, unused);
     }
 
+    bool motionExists(const char* model, const char* motion)
+    {
+        const std::string file = std::format("{}_{}", model, motion);
+        std::lock_guard lock(g_existsMutex);
+        auto it = g_existsCache.find(file);
+        if (it != g_existsCache.end()) return it->second;
+        const bool exists = g_fileExists(file.c_str(), "anim", nullptr);
+        g_existsCache.emplace(file, exists);
+        if (!exists) log(std::format("motion {} missing", file));
+        return exists;
+    }
+
+    // Short motion name to use for the swapped model, or the original if it exists / no fallback works.
+    const char* remapMotion(const char* model, const char* motion)
+    {
+        if (motion[0] == '\0' || std::strcmp(motion, model) == 0) return motion; // bind pose / full name
+        if (motionExists(model, motion)) return motion;
+
+        const char* fallback = IDLE_FALLBACK;
+        for (const auto& entry : MOTION_FALLBACKS)
+            if (std::strcmp(motion, entry.field) == 0) fallback = entry.battle;
+
+        if (motionExists(model, fallback)) return fallback;
+        if (fallback != IDLE_FALLBACK && motionExists(model, IDLE_FALLBACK)) return IDLE_FALLBACK;
+        return motion;
+    }
+
     void* hookBuildMotionName(void* model, void* out, const char* motion)
     {
-        if (g_remapMotions && g_enabled && !g_temporaryHuman && g_model[0] != '\0' && model != nullptr
-            && motion != nullptr)
+        if (g_fileExists != nullptr && g_remapMotions && g_enabled && !g_temporaryHuman && g_model[0] != '\0'
+            && model != nullptr && motion != nullptr)
         {
             const char* name = static_cast<const char*>(model) + OFF_MODEL_NAME;
-            if (std::strcmp(name, g_model) == 0)
-            {
-                for (const auto& fallback : MOTION_FALLBACKS)
-                {
-                    if (std::strcmp(motion, fallback.field) == 0)
-                    {
-                        if (std::strstr(fallback.nativeModels, name) == nullptr) motion = fallback.battle;
-                        break;
-                    }
-                }
-            }
+            if (std::strcmp(name, g_model) == 0) motion = remapMotion(name, motion);
         }
         return g_originalBuildMotionName(model, out, motion);
     }
@@ -224,8 +252,13 @@ public:
                         g_enabled.load()));
 
         // Motion fallback is optional: without it the swap still works, the Digimon just
-        // holds its bind pose when the field motions are missing.
-        if (char* hit = findSignature(SIG_BUILD_MOTION_NAME))
+        // keeps its previous motion when a requested one is missing.
+        if (char* exists = findSignature(SIG_FILE_EXISTS))
+            g_fileExists = reinterpret_cast<FileExistsFn>(exists + SIG_FILE_EXISTS_OFFSET);
+        else
+            log("Archive_FileExists signature not found; motions will not be remapped.");
+
+        if (char* hit = findSignature(SIG_BUILD_MOTION_NAME); hit != nullptr && g_fileExists != nullptr)
         {
             char* motionTarget = hit + SIG_BUILD_MOTION_NAME_OFFSET;
             if (MH_CreateHook(motionTarget, reinterpret_cast<void*>(&hookBuildMotionName),
