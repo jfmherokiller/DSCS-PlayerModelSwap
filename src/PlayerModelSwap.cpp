@@ -9,9 +9,11 @@
 // uses chr320): the character controller is sized from the Digimon id parsed out of the
 // model name, and every Digimon skeleton carries the TP01/CP01/GP01/FP01 locators.
 #include <dscs/GameInterface.h>
+#include <dscs/Symbols.h>
 #include <modloader/plugin.h>
 #include <modloader/sigscan.h>
 #include <modloader/utils.h>
+#include <squirrel/squirrel.h>
 
 #include <MinHook.h>
 #include <Windows.h>
@@ -22,8 +24,10 @@
 #include <cstring>
 #include <format>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace
 {
@@ -224,6 +228,61 @@ namespace
         }
         return g_originalModelLoad(self, name, flag);
     }
+
+    // --- Script error logging (diagnostic) ---
+    // The game installs no Squirrel error handler, so failing event-script helpers abort silently.
+    // Install one on every VM/thread we see and force raiseerror so it runs; results are unchanged.
+    using SqCallFn   = SQRESULT (*)(HSQUIRRELVM v, SQInteger params, SQBool retval, SQBool raiseerror);
+    using SqWakeupFn = SQRESULT (*)(HSQUIRRELVM v, SQBool resumedret, SQBool retval, SQBool raiseerror, SQBool throwerror);
+    SqCallFn g_originalSqCall     = nullptr;
+    SqWakeupFn g_originalSqWakeup = nullptr;
+    std::atomic<bool> g_logScriptErrors{ true };
+    std::mutex g_sqMutex;
+    std::unordered_set<HSQUIRRELVM> g_sqHandled;
+    std::set<std::string> g_sqLogged;
+
+    SQInteger scriptErrorHandler(HSQUIRRELVM v)
+    {
+        const SQChar* message = "?";
+        if (sq_gettop(v) >= 2)
+        {
+            sq_tostring(v, 2);
+            sq_getstring(v, -1, &message);
+        }
+        std::string text = std::format("script error: {}", message ? message : "?");
+        SQStackInfos si{};
+        for (SQInteger level = 1; level < 8 && SQ_SUCCEEDED(sq_stackinfos(v, level, &si)); level++)
+            text += std::format("\n    at {} ({}:{})", si.funcname ? si.funcname : "?",
+                                si.source ? si.source : "?", static_cast<int64_t>(si.line));
+        if (sq_gettop(v) >= 2) sq_pop(v, 1);
+
+        std::lock_guard lock(g_sqMutex);
+        if (g_sqLogged.size() < 500 && g_sqLogged.insert(text).second) log(text);
+        return 0;
+    }
+
+    void ensureErrorHandler(HSQUIRRELVM v)
+    {
+        if (!g_logScriptErrors || v == nullptr) return;
+        {
+            std::lock_guard lock(g_sqMutex);
+            if (!g_sqHandled.insert(v).second) return;
+        }
+        sq_newclosure(v, scriptErrorHandler, 0);
+        sq_seterrorhandler(v);
+    }
+
+    SQRESULT hookSqCall(HSQUIRRELVM v, SQInteger params, SQBool retval, SQBool raiseerror)
+    {
+        ensureErrorHandler(v);
+        return g_originalSqCall(v, params, retval, g_logScriptErrors ? SQTrue : raiseerror);
+    }
+
+    SQRESULT hookSqWakeup(HSQUIRRELVM v, SQBool resumedret, SQBool retval, SQBool raiseerror, SQBool throwerror)
+    {
+        ensureErrorHandler(v);
+        return g_originalSqWakeup(v, resumedret, retval, g_logScriptErrors ? SQTrue : raiseerror, throwerror);
+    }
 } // namespace
 
 // resources/PlayerModelSwap.ini
@@ -248,6 +307,7 @@ static void readIni(const std::string& path)
     g_toggleKey = GetPrivateProfileIntA("PlayerModelSwap", "TemporaryHumanKey", VK_F8, path.c_str());
     g_remapMotions = GetPrivateProfileIntA("PlayerModelSwap", "RemapFieldMotions", 1, path.c_str()) != 0;
     g_replaceInCutscenes = GetPrivateProfileIntA("PlayerModelSwap", "ReplaceInCutscenes", 1, path.c_str()) != 0;
+    g_logScriptErrors = GetPrivateProfileIntA("PlayerModelSwap", "LogScriptErrors", 1, path.c_str()) != 0;
 }
 
 // --- Squirrel API: PlayerModelSwap.SetModel("chr320"), GetModel(), SetEnabled(bool) ---
@@ -378,6 +438,19 @@ public:
         }
         else
             log("CGameModel::Load / Player_GetDefaultModelName signature not found; cutscenes keep the human model.");
+
+        if (g_logScriptErrors)
+        {
+            char* sqCall   = getGameSymbol("sq_call");
+            char* sqWakeup = getGameSymbol("sq_wakeupvm");
+            const bool ok  = sqCall && sqWakeup
+                            && MH_CreateHook(sqCall, reinterpret_cast<void*>(&hookSqCall),
+                                             reinterpret_cast<void**>(&g_originalSqCall)) == MH_OK
+                            && MH_CreateHook(sqWakeup, reinterpret_cast<void*>(&hookSqWakeup),
+                                             reinterpret_cast<void**>(&g_originalSqWakeup)) == MH_OK
+                            && MH_EnableHook(sqCall) == MH_OK && MH_EnableHook(sqWakeup) == MH_OK;
+            log(ok ? "script error logging enabled" : "script error logging unavailable");
+        }
 
         modLoader.addSquirrelFunction("PlayerModelSwap", "SetModel", nullptr, SqSetModel);
         modLoader.addSquirrelFunction("PlayerModelSwap", "GetModel", nullptr, SqGetModel);
