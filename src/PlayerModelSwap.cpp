@@ -58,6 +58,24 @@ namespace
     using IsPlayingMotionFn                   = bool (*)(void* self, const char* motion);
     IsPlayingMotionFn g_originalIsPlayingMotion = nullptr;
 
+    // CGameModel::Load (secondary vtable slot 7): (ModelBase* self, const char* name, bool flag) -> bool.
+    //   Every model load (field, cutscene actors, menus) passes through here; the name becomes the
+    //   model's name (+0xD8), which motion lookups are built from.
+    constexpr const char* SIG_MODEL_LOAD =
+        "40 53 48 83 EC 40 48 8B D9 E8 ?? ?? ?? ?? 84 C0 75 06 48 83 C4 40 5B C3 48 8B 8B 20 01 00 00 48 85 C9 "
+        "74 07 B2 01 E8";
+    using ModelLoadFn             = bool (*)(void* self, const char* name, uint8_t flag);
+    ModelLoadFn g_originalModelLoad = nullptr;
+
+    // Player_GetDefaultModelName(Player*) -> "pc001"/"pc002" (or "pc020" in Hacker's Memory).
+    constexpr const char* SIG_GET_DEFAULT_MODEL_NAME =
+        "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 48 8B 90 90 00 00 00 83 7A 08 00 74 0D 48 8D 05 ?? ?? ?? ?? "
+        "48 83 C4 20 5B C3 8B 4B 08";
+    using GetDefaultModelNameFn                   = const char* (*)(void* player);
+    GetDefaultModelNameFn g_getDefaultModelName   = nullptr;
+    constexpr int OFF_PLAYER_CLOTH_MODEL          = 0x1D0; // char[8], costume model (pc1xx..pc3xx)
+    std::atomic<bool> g_replaceInCutscenes{ true };
+
     // Archive_FileExists(const char* name, const char* ext, const char* archive) -> bool
     //   archive == nullptr checks every registered archive, mod folders included.
     constexpr const char* SIG_FILE_EXISTS =
@@ -170,6 +188,42 @@ namespace
         const void* model = self ? *reinterpret_cast<void**>(static_cast<char*>(self) + 8) : nullptr;
         return g_originalIsPlayingMotion(self, remapForModel(model, motion));
     }
+
+    // Same player selection as the game's Squirrel natives: ctx[18]->mode ? ctx[15] : ctx[6].
+    void* currentPlayer()
+    {
+        auto* ctx = reinterpret_cast<uint64_t*>(dscs::getGameContext());
+        if (ctx == nullptr || ctx[18] == 0) return nullptr;
+        const int mode = *reinterpret_cast<int*>(ctx[18] + 8);
+        return reinterpret_cast<void*>(mode ? ctx[15] : ctx[6]);
+    }
+
+    bool isProtagonistModelName(const char* name)
+    {
+        void* player = currentPlayer();
+        if (player == nullptr) return false;
+        const char* cloth = static_cast<const char*>(player) + OFF_PLAYER_CLOTH_MODEL;
+        if (cloth[0] != '\0' && strncmp(name, cloth, 8) == 0 && std::strlen(name) == strnlen(cloth, 8)) return true;
+        const char* def = g_getDefaultModelName(player);
+        return def != nullptr && std::strcmp(name, def) == 0;
+    }
+
+    bool hookModelLoad(void* self, const char* name, uint8_t flag)
+    {
+        if (g_replaceInCutscenes && g_enabled && !g_temporaryHuman && g_model[0] != '\0' && name != nullptr
+            && name[0] == 'p' && name[1] == 'c' && isProtagonistModelName(name))
+        {
+            static std::string lastLogged;
+            std::lock_guard lock(g_existsMutex);
+            if (lastLogged != name)
+            {
+                lastLogged = name;
+                log(std::format("model {} -> {}", name, g_model));
+            }
+            name = g_model;
+        }
+        return g_originalModelLoad(self, name, flag);
+    }
 } // namespace
 
 // resources/PlayerModelSwap.ini
@@ -193,6 +247,7 @@ static void readIni(const std::string& path)
     g_enabled   = GetPrivateProfileIntA("PlayerModelSwap", "Enabled", 1, path.c_str()) != 0;
     g_toggleKey = GetPrivateProfileIntA("PlayerModelSwap", "TemporaryHumanKey", VK_F8, path.c_str());
     g_remapMotions = GetPrivateProfileIntA("PlayerModelSwap", "RemapFieldMotions", 1, path.c_str()) != 0;
+    g_replaceInCutscenes = GetPrivateProfileIntA("PlayerModelSwap", "ReplaceInCutscenes", 1, path.c_str()) != 0;
 }
 
 // --- Squirrel API: PlayerModelSwap.SetModel("chr320"), GetModel(), SetEnabled(bool) ---
@@ -305,6 +360,24 @@ public:
         }
         else
             log("Model_BuildMotionName signature not found; field motions will not be remapped.");
+
+        // Cutscene/menu actors: swap the protagonist's model wherever it is loaded by name.
+        char* modelLoad = findSignature(SIG_MODEL_LOAD);
+        char* getDefault = findSignature(SIG_GET_DEFAULT_MODEL_NAME);
+        if (modelLoad != nullptr && getDefault != nullptr)
+        {
+            g_getDefaultModelName = reinterpret_cast<GetDefaultModelNameFn>(getDefault);
+            if (MH_CreateHook(modelLoad, reinterpret_cast<void*>(&hookModelLoad),
+                              reinterpret_cast<void**>(&g_originalModelLoad)) == MH_OK
+                && MH_EnableHook(modelLoad) == MH_OK)
+                log(std::format("hooked CGameModel::Load @ RVA 0x{:X}; cutscene replacement={}",
+                                static_cast<uint64_t>(modelLoad - getBaseOffset()),
+                                g_replaceInCutscenes.load()));
+            else
+                log("failed to hook CGameModel::Load; cutscenes keep the human model.");
+        }
+        else
+            log("CGameModel::Load / Player_GetDefaultModelName signature not found; cutscenes keep the human model.");
 
         modLoader.addSquirrelFunction("PlayerModelSwap", "SetModel", nullptr, SqSetModel);
         modLoader.addSquirrelFunction("PlayerModelSwap", "GetModel", nullptr, SqGetModel);
