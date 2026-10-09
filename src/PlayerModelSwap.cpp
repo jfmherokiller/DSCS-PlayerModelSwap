@@ -49,6 +49,15 @@ namespace
     using BuildMotionNameFn = void* (*)(void* model, void* out, const char* motion);
     BuildMotionNameFn g_originalBuildMotionName = nullptr;
 
+    // FieldChar_IsPlayingMotion(FieldChar* self, const char* motion) -> bool
+    //   compares "<model>_<motion>" with the playing anim; gates locomotion restarts, footsteps
+    //   and interactions (idle check), so it must see the same remap as Model_BuildMotionName.
+    constexpr const char* SIG_IS_PLAYING_MOTION =
+        "40 53 48 83 EC 50 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 44 24 40 4C 8B 41 08 4D 85 C0 75 04 33 DB EB 07 "
+        "49 8D 98 F8 00 00 00 49 83 C0 18";
+    using IsPlayingMotionFn                   = bool (*)(void* self, const char* motion);
+    IsPlayingMotionFn g_originalIsPlayingMotion = nullptr;
+
     // Archive_FileExists(const char* name, const char* ext, const char* archive) -> bool
     //   archive == nullptr checks every registered archive, mod folders included.
     constexpr const char* SIG_FILE_EXISTS =
@@ -142,15 +151,24 @@ namespace
         return motion;
     }
 
+    const char* remapForModel(const void* model, const char* motion)
+    {
+        if (g_fileExists == nullptr || !g_remapMotions || !g_enabled || g_temporaryHuman || g_model[0] == '\0'
+            || model == nullptr || motion == nullptr)
+            return motion;
+        const char* name = static_cast<const char*>(model) + OFF_MODEL_NAME;
+        return std::strcmp(name, g_model) == 0 ? remapMotion(name, motion) : motion;
+    }
+
     void* hookBuildMotionName(void* model, void* out, const char* motion)
     {
-        if (g_fileExists != nullptr && g_remapMotions && g_enabled && !g_temporaryHuman && g_model[0] != '\0'
-            && model != nullptr && motion != nullptr)
-        {
-            const char* name = static_cast<const char*>(model) + OFF_MODEL_NAME;
-            if (std::strcmp(name, g_model) == 0) motion = remapMotion(name, motion);
-        }
-        return g_originalBuildMotionName(model, out, motion);
+        return g_originalBuildMotionName(model, out, remapForModel(model, motion));
+    }
+
+    bool hookIsPlayingMotion(void* self, const char* motion)
+    {
+        const void* model = self ? *reinterpret_cast<void**>(static_cast<char*>(self) + 8) : nullptr;
+        return g_originalIsPlayingMotion(self, remapForModel(model, motion));
     }
 } // namespace
 
@@ -269,6 +287,21 @@ public:
                                 g_remapMotions.load()));
             else
                 log("failed to hook Model_BuildMotionName; field motions will not be remapped.");
+
+            // Without this the remap breaks the engine's "already playing" checks (restarts every
+            // frame, no footsteps, no interactions), so disable the remap if it can't be hooked.
+            char* isPlaying = findSignature(SIG_IS_PLAYING_MOTION);
+            if (isPlaying != nullptr
+                && MH_CreateHook(isPlaying, reinterpret_cast<void*>(&hookIsPlayingMotion),
+                                 reinterpret_cast<void**>(&g_originalIsPlayingMotion)) == MH_OK
+                && MH_EnableHook(isPlaying) == MH_OK)
+                log(std::format("hooked FieldChar_IsPlayingMotion @ RVA 0x{:X}",
+                                static_cast<uint64_t>(isPlaying - getBaseOffset())));
+            else
+            {
+                log("FieldChar_IsPlayingMotion not hooked; disabling motion remap.");
+                g_remapMotions = false;
+            }
         }
         else
             log("Model_BuildMotionName signature not found; field motions will not be remapped.");
