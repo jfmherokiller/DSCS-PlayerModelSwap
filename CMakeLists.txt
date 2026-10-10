@@ -29,6 +29,24 @@ add_library(minhook_static STATIC
     ${minhook_SOURCE_DIR}/src/hde/hde64.c)
 target_include_directories(minhook_static PUBLIC ${minhook_SOURCE_DIR}/include)
 
+CPMAddPackage(
+  NAME imgui
+  GITHUB_REPOSITORY "ocornut/imgui"
+  GIT_TAG "v1.92.9b"
+  DOWNLOAD_ONLY YES
+)
+
+add_library(imgui_static STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+target_include_directories(imgui_static PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+# The game reads pads itself; keep the overlay from loading XInput.
+target_compile_definitions(imgui_static PUBLIC IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+
 # --- Building ---
-add_library(DSCSPlayerModelSwap SHARED "src/PlayerModelSwap.cpp")
-target_link_libraries(DSCSPlayerModelSwap PRIVATE DSCSModLoader minhook_static)
+add_library(DSCSPlayerModelSwap SHARED "src/PlayerModelSwap.cpp" "src/Overlay.cpp")
+target_link_libraries(DSCSPlayerModelSwap PRIVATE DSCSModLoader minhook_static imgui_static dinput8 dxguid opengl32)

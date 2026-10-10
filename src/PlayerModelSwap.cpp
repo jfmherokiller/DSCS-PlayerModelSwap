@@ -8,6 +8,8 @@
 // The engine already supports a Digimon as the controlled field character (control type 5
 // uses chr320): the character controller is sized from the Digimon id parsed out of the
 // model name, and every Digimon skeleton carries the TP01/CP01/GP01/FP01 locators.
+#include "PlayerModelSwap.h"
+
 #include <dscs/GameInterface.h>
 #include <dscs/Symbols.h>
 #include <modloader/plugin.h>
@@ -28,6 +30,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace
 {
@@ -109,6 +112,34 @@ namespace
     using GetControlModelNameFn = const char* (*)(void* player, void* unused);
     GetControlModelNameFn g_original = nullptr;
 
+    // SqNative_SetControlPlayerType(int type): sets the type, then rebuilds the player through
+    //   sceneManager->scene->vtbl[54]; we reuse that path to apply a new model immediately.
+    constexpr const char* SIG_SET_CONTROL_PLAYER_TYPE =
+        "40 53 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 8B D9 E8 ?? ?? ?? ?? 48 8B 90 90 00 00 00 83 7A 08 00 "
+        "74 06 48 8B 50 78 EB 04 48 8B 50 30 89 5A 34 48 8B 05";
+    constexpr int SET_CONTROL_SCENE_MANAGER_DISP = 0x33; // mov rax, [rip+disp32] (scene manager singleton)
+    constexpr int OFF_MANAGER_SCENE              = 0x1A0;
+    constexpr int OFF_SCENE_VTBL_REBUILD_PLAYER  = 0x1B0;
+    // Field scene's rebuild slot: mov rcx,[rcx+1F8h] (field player); jmp FieldPlayer_RebuildModel.
+    constexpr uint8_t FIELD_REBUILD_PLAYER_PREFIX[] = { 0x48, 0x8B, 0x89, 0xF8, 0x01, 0x00, 0x00, 0xE9 };
+    constexpr int OFF_FIELD_SCENE_PLAYER             = 0x1F8;
+    void** g_sceneManagerSlot                        = nullptr;
+    std::atomic<bool> g_applyPending{ false };
+
+    // SqNative_GetCharName(uint id) -> const char* (current language). GetItemName & co. share the
+    //   body byte for byte; only the table-name string loaded at +0x4A differs.
+    constexpr const char* SIG_GET_TEXT_NATIVE =
+        "48 89 5C 24 08 57 48 83 EC 30 8B D9 E8 ?? ?? ?? ?? 48 8B F8 48 8B 05 ?? ?? ?? ?? 48 85 C0 75 23 "
+        "B9 50 01 00 00 E8 ?? ?? ?? ?? 48 89 44 24 48 48 85 C0 74 08 48 8B C8 E8 ?? ?? ?? ?? 48 89 05 ?? ?? ?? ?? "
+        "44 8B 88 B4 00 00 00 48 8D 15";
+    constexpr int GET_TEXT_TABLE_DISP = 0x4D;
+    using GetCharNameFn               = const char* (*)(uint32_t id);
+    GetCharNameFn g_getCharName       = nullptr;
+    constexpr uint32_t CHARNAME_DIGIMON_BASE = 1000; // charname id = 1000 + Digimon id
+
+    std::string g_iniPath;
+    int g_menuKey = VK_F7;
+
     std::atomic<bool> g_enabled{ true };
     std::atomic<bool> g_temporaryHuman{ false };
     char g_model[16] = "";     // e.g. "chr320"; empty = no swap
@@ -125,6 +156,8 @@ namespace
             std::fflush(file);
         }
     }
+
+    void logLine(const std::string& message) { log(message); }
 
     bool isValidModel(const char* model)
     {
@@ -283,13 +316,83 @@ namespace
         ensureErrorHandler(v);
         return g_originalSqWakeup(v, resumedret, retval, g_logScriptErrors ? SQTrue : raiseerror, throwerror);
     }
+
+    // --- Immediate apply / Digimon names ---
+    // All .text matches of a pattern (the loader only exports a unique-match scan).
+    std::vector<char*> findAllInText(const char* pattern)
+    {
+        std::vector<int> bytes; // -1 = wildcard
+        for (const char* p = pattern; *p;)
+        {
+            if (*p == ' ') { p++; continue; }
+            if (*p == '?') { bytes.push_back(-1); while (*p == '?') p++; continue; }
+            bytes.push_back(static_cast<int>(std::strtoul(std::string(p, 2).c_str(), nullptr, 16)));
+            p += 2;
+        }
+        std::vector<char*> hits;
+        auto* base = reinterpret_cast<uint8_t*>(getBaseOffset());
+        auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        auto* sec  = IMAGE_FIRST_SECTION(nt);
+        for (int s = 0; s < nt->FileHeader.NumberOfSections; s++, sec++)
+        {
+            if (std::memcmp(sec->Name, ".text", 6) != 0) continue;
+            uint8_t* begin = base + sec->VirtualAddress;
+            const size_t size = sec->Misc.VirtualSize;
+            for (size_t i = 0; i + bytes.size() <= size; i++)
+            {
+                size_t k = 0;
+                while (k < bytes.size() && (bytes[k] < 0 || begin[i + k] == bytes[k])) k++;
+                if (k == bytes.size()) hits.push_back(reinterpret_cast<char*>(begin + i));
+            }
+        }
+        return hits;
+    }
+
+    char* ripTarget(char* insnDisp) // rel32 at insnDisp, instruction ends right after it
+    {
+        return insnDisp + 4 + *reinterpret_cast<int32_t*>(insnDisp);
+    }
+
+    void resolveExtras()
+    {
+        if (char* fn = findSignature(SIG_SET_CONTROL_PLAYER_TYPE))
+            g_sceneManagerSlot = reinterpret_cast<void**>(ripTarget(fn + SET_CONTROL_SCENE_MANAGER_DISP));
+        else
+            log("SetControlPlayerType signature not found; model changes apply on the next map load.");
+
+        for (char* fn : findAllInText(SIG_GET_TEXT_NATIVE))
+            if (std::strcmp(ripTarget(fn + GET_TEXT_TABLE_DISP), "CharName") == 0)
+                g_getCharName = reinterpret_cast<GetCharNameFn>(fn);
+        if (g_getCharName == nullptr) log("GetCharName not found; the menu lists model codes only.");
+    }
+
+    // Rebuild the field player now (same call SetControlPlayerType makes). Field scene only.
+    void rebuildFieldPlayer()
+    {
+        if (g_sceneManagerSlot == nullptr || *g_sceneManagerSlot == nullptr) return;
+        char* scene = *reinterpret_cast<char**>(static_cast<char*>(*g_sceneManagerSlot) + OFF_MANAGER_SCENE);
+        if (scene == nullptr) return;
+        auto* vtbl    = *reinterpret_cast<char***>(scene);
+        char* rebuild = vtbl[OFF_SCENE_VTBL_REBUILD_PLAYER / sizeof(void*)];
+        if (std::memcmp(rebuild, FIELD_REBUILD_PLAYER_PREFIX, sizeof(FIELD_REBUILD_PLAYER_PREFIX)) != 0) return;
+        if (*reinterpret_cast<void**>(scene + OFF_FIELD_SCENE_PLAYER) == nullptr) return;
+        if (!isProtagonist(currentPlayer())) return;
+        reinterpret_cast<void (*)(char*)>(rebuild)(scene);
+        log("field player rebuilt");
+    }
+
+    void writeIni(const char* key, const char* value)
+    {
+        if (!g_iniPath.empty()) WritePrivateProfileStringA("PlayerModelSwap", key, value, g_iniPath.c_str());
+    }
 } // namespace
 
-// resources/PlayerModelSwap.ini
+// resources/PlayerModelSwap.ini (see PlayerModelSwap.ini for every key)
 //   [PlayerModelSwap]
 //   Model=chr320        ; Digimon model code (chr + 3 digits). Empty = protagonist.
 //   Enabled=1
 //   TemporaryHumanKey=119   ; decimal virtual-key code (F8), 0 disables the hotkey
+//   MenuKey=118             ; in-game picker (F7), 0 disables the menu
 static void readIni(const std::string& path)
 {
     char buffer[32]{};
@@ -308,6 +411,66 @@ static void readIni(const std::string& path)
     g_remapMotions = GetPrivateProfileIntA("PlayerModelSwap", "RemapFieldMotions", 1, path.c_str()) != 0;
     g_replaceInCutscenes = GetPrivateProfileIntA("PlayerModelSwap", "ReplaceInCutscenes", 1, path.c_str()) != 0;
     g_logScriptErrors = GetPrivateProfileIntA("PlayerModelSwap", "LogScriptErrors", 1, path.c_str()) != 0;
+    g_menuKey = GetPrivateProfileIntA("PlayerModelSwap", "MenuKey", VK_F7, path.c_str());
+    g_iniPath = path;
+}
+
+// --- Interface for the in-game menu (PlayerModelSwap.h) ---
+void pms::log(const std::string& message) { logLine(message); }
+
+std::vector<pms::ModelEntry> pms::listModels()
+{
+    std::vector<ModelEntry> models;
+    for (int id = 1; id <= 999; id++)
+    {
+        char code[8];
+        std::snprintf(code, sizeof(code), "chr%03d", id);
+        if (g_fileExists != nullptr && !g_fileExists(code, "geom", nullptr)) continue;
+        ModelEntry entry{ code, "", false };
+        if (g_getCharName != nullptr)
+            if (const char* name = g_getCharName(CHARNAME_DIGIMON_BASE + id)) entry.name = name;
+        entry.fieldMotions = g_fileExists != nullptr && g_fileExists((entry.code + "_fn01").c_str(), "anim", nullptr);
+        models.push_back(std::move(entry));
+    }
+    return models;
+}
+
+void pms::onFrame()
+{
+    if (g_applyPending.exchange(false)) rebuildFieldPlayer();
+}
+
+std::string pms::getModel() { return g_model; }
+
+void pms::setModel(const std::string& code)
+{
+    if (!code.empty() && !isValidModel(code.c_str())) return;
+    strcpy_s(g_model, code.c_str());
+    writeIni("Model", g_model);
+    g_applyPending = true;
+    log(std::format("model set to '{}' from the menu", g_model));
+}
+
+bool pms::getEnabled() { return g_enabled; }
+void pms::setEnabled(bool enabled)
+{
+    g_enabled = enabled;
+    writeIni("Enabled", enabled ? "1" : "0");
+    g_applyPending = true;
+}
+
+bool pms::getTemporaryHuman() { return g_temporaryHuman; }
+void pms::setTemporaryHuman(bool human)
+{
+    g_temporaryHuman = human;
+    g_applyPending   = true;
+}
+
+bool pms::getReplaceInCutscenes() { return g_replaceInCutscenes; }
+void pms::setReplaceInCutscenes(bool replace)
+{
+    g_replaceInCutscenes = replace;
+    writeIni("ReplaceInCutscenes", replace ? "1" : "0");
 }
 
 // --- Squirrel API: PlayerModelSwap.SetModel("chr320"), GetModel(), SetEnabled(bool) ---
@@ -348,7 +511,8 @@ static DWORD WINAPI hotkeyThread(LPVOID)
         if (down && !wasDown && pid == GetCurrentProcessId() && g_model[0] != '\0')
         {
             g_temporaryHuman = !g_temporaryHuman;
-            log(std::format("temporary human: {} (applies on the next map load)", g_temporaryHuman ? "on" : "off"));
+            g_applyPending   = true;
+            log(std::format("temporary human: {}", g_temporaryHuman ? "on" : "off"));
         }
         wasDown = down;
         Sleep(25);
@@ -455,6 +619,9 @@ public:
         modLoader.addSquirrelFunction("PlayerModelSwap", "SetModel", nullptr, SqSetModel);
         modLoader.addSquirrelFunction("PlayerModelSwap", "GetModel", nullptr, SqGetModel);
         modLoader.addSquirrelFunction("PlayerModelSwap", "SetEnabled", nullptr, SqSetEnabled);
+
+        resolveExtras();
+        overlay::install(g_menuKey);
 
         CreateThread(nullptr, 0, hotkeyThread, nullptr, 0, nullptr);
     }
