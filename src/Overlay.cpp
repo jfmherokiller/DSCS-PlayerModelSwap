@@ -58,18 +58,45 @@ namespace
     template <int I>
     HRESULT STDMETHODCALLTYPE hookGetDeviceState(void* self, DWORD size, void* data)
     {
-        const HRESULT result = g_originalGetDeviceState[I](self, size, data);
-        if (g_open && SUCCEEDED(result) && data) std::memset(data, 0, size);
-        return result;
+        if (g_open)
+        {
+            // Give up exclusive access so Windows delivers mouse/keyboard messages and the cursor again.
+            reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*)>((*reinterpret_cast<void***>(self))[8])(self);
+            if (data) std::memset(data, 0, size);
+            return DI_OK;
+        }
+        return g_originalGetDeviceState[I](self, size, data);
     }
 
     template <int I>
     HRESULT STDMETHODCALLTYPE hookGetDeviceData(void* self, DWORD size, DIDEVICEOBJECTDATA* data, DWORD* inOut,
                                                 DWORD flags)
     {
-        const HRESULT result = g_originalGetDeviceData[I](self, size, data, inOut, flags);
-        if (g_open && SUCCEEDED(result) && inOut) *inOut = 0;
-        return result;
+        if (g_open)
+        {
+            reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*)>((*reinterpret_cast<void***>(self))[8])(self);
+            if (inOut) *inOut = 0;
+            return DI_OK;
+        }
+        return g_originalGetDeviceData[I](self, size, data, inOut, flags);
+    }
+
+    using AcquireFn             = HRESULT(STDMETHODCALLTYPE*)(void* self);
+    using SetCooperativeLevelFn = HRESULT(STDMETHODCALLTYPE*)(void* self, HWND hwnd, DWORD flags);
+    AcquireFn g_originalAcquire[2]{};
+    SetCooperativeLevelFn g_originalSetCooperativeLevel[2]{};
+
+    template <int I>
+    HRESULT STDMETHODCALLTYPE hookAcquire(void* self)
+    {
+        return g_open ? DI_OK : g_originalAcquire[I](self); // stay unacquired while the menu is open
+    }
+
+    template <int I>
+    HRESULT STDMETHODCALLTYPE hookSetCooperativeLevel(void* self, HWND hwnd, DWORD flags)
+    {
+        pms::log(std::format("DirectInput cooperative level 0x{:X} (exclusive={})", flags, (flags & DISCL_EXCLUSIVE) != 0));
+        return g_originalSetCooperativeLevel[I](self, hwnd, flags);
     }
 
     DWORD WINAPI hookXInputGetState(DWORD user, XINPUT_STATE* state)
@@ -110,6 +137,10 @@ namespace
                          reinterpret_cast<void**>(&g_originalGetDeviceState[i]));
                     hook(vtbl[10], i == 0 ? (void*)&hookGetDeviceData<0> : (void*)&hookGetDeviceData<1>,
                          reinterpret_cast<void**>(&g_originalGetDeviceData[i]));
+                    hook(vtbl[7], i == 0 ? (void*)&hookAcquire<0> : (void*)&hookAcquire<1>,
+                         reinterpret_cast<void**>(&g_originalAcquire[i]));
+                    hook(vtbl[13], i == 0 ? (void*)&hookSetCooperativeLevel<0> : (void*)&hookSetCooperativeLevel<1>,
+                         reinterpret_cast<void**>(&g_originalSetCooperativeLevel[i]));
                 }
                 device->Release();
             }
@@ -117,27 +148,62 @@ namespace
         }
     }
 
+    std::atomic<int> g_messagesSeen{ 0 };
+
     LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
-        if (msg == WM_KEYDOWN && static_cast<int>(wParam) == g_menuKey && (lParam & 0x40000000) == 0)
-        {
-            g_open = !g_open;
-            if (g_open) ImGui::GetIO().ClearInputKeys();
-            return 0;
-        }
+        g_messagesSeen++;
         if (g_open)
         {
-            if (msg == WM_KEYDOWN && wParam == VK_ESCAPE)
-            {
-                g_open = false;
-                return 0;
-            }
             ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
             if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || (msg >= WM_KEYFIRST && msg <= WM_KEYLAST))
                 return 0;
             if (msg == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT) return TRUE; // ImGui draws the cursor
         }
         return CallWindowProcW(g_originalWndProc, hwnd, msg, wParam, lParam);
+    }
+
+    // Keys are polled (like the F8 hotkey): the game's DirectInput can keep WM_KEYDOWN from arriving.
+    bool pressed(int key)
+    {
+        static bool down[256]{};
+        const bool now  = key > 0 && key < 256 && (GetAsyncKeyState(key) & 0x8000) != 0;
+        const bool edge = now && !down[key & 0xFF];
+        if (key > 0 && key < 256) down[key] = now;
+        return edge;
+    }
+
+    bool gameFocused()
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        return pid == GetCurrentProcessId();
+    }
+
+    void pollToggle()
+    {
+        const bool toggle = pressed(g_menuKey);
+        const bool escape = pressed(VK_ESCAPE);
+        if (!gameFocused()) return;
+        if (toggle || (escape && g_open))
+        {
+            g_open = !g_open;
+            if (g_open) ImGui::GetIO().ClearInputKeys();
+            pms::log(std::format("menu {} (window messages seen so far: {})", g_open ? "opened" : "closed",
+                                 g_messagesSeen.load()));
+        }
+    }
+
+    // Mouse fallback for when the game's exclusive input hides window messages.
+    void pollMouse()
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        POINT point{};
+        if (GetCursorPos(&point) && ScreenToClient(g_hwnd, &point))
+            io.AddMousePosEvent(static_cast<float>(point.x), static_cast<float>(point.y));
+        const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        io.AddMouseButtonEvent(0, (GetAsyncKeyState(swapped ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0);
+        io.AddMouseButtonEvent(1, (GetAsyncKeyState(swapped ? VK_LBUTTON : VK_RBUTTON) & 0x8000) != 0);
     }
 
     void addFonts()
@@ -284,6 +350,7 @@ namespace
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplWin32_NewFrame();
+        pollMouse();
         ImGui::NewFrame();
         drawMenu();
         ImGui::Render();
@@ -304,10 +371,17 @@ namespace
             {
                 g_initialized = initialize(hdc);
                 g_failed      = !g_initialized;
-                pms::log(g_initialized ? std::format("menu ready (virtual key {})", g_menuKey)
+                char cls[64]{};
+                GetClassNameA(g_hwnd, cls, sizeof(cls));
+                pms::log(g_initialized ? std::format("menu ready (virtual key {}, window class '{}', top-level={})",
+                                                     g_menuKey, cls, GetAncestor(g_hwnd, GA_ROOT) == g_hwnd)
                                        : "menu: ImGui/OpenGL initialization failed; menu disabled");
             }
-            if (g_initialized && g_open) renderMenu();
+            if (g_initialized)
+            {
+                pollToggle();
+                if (g_open) renderMenu();
+            }
         }
         return g_originalSwapBuffers(hdc);
     }

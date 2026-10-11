@@ -356,7 +356,11 @@ namespace
     void resolveExtras()
     {
         if (char* fn = findSignature(SIG_SET_CONTROL_PLAYER_TYPE))
+        {
             g_sceneManagerSlot = reinterpret_cast<void**>(ripTarget(fn + SET_CONTROL_SCENE_MANAGER_DISP));
+            log(std::format("scene manager slot @ RVA 0x{:X}",
+                            static_cast<uint64_t>(reinterpret_cast<char*>(g_sceneManagerSlot) - getBaseOffset())));
+        }
         else
             log("SetControlPlayerType signature not found; model changes apply on the next map load.");
 
@@ -369,14 +373,22 @@ namespace
     // Rebuild the field player now (same call SetControlPlayerType makes). Field scene only.
     void rebuildFieldPlayer()
     {
-        if (g_sceneManagerSlot == nullptr || *g_sceneManagerSlot == nullptr) return;
+        auto skip = [](const std::string& why) { log("immediate apply skipped: " + why + " (applies on the next map load)"); };
+        if (g_sceneManagerSlot == nullptr || *g_sceneManagerSlot == nullptr) return skip("no scene manager");
         char* scene = *reinterpret_cast<char**>(static_cast<char*>(*g_sceneManagerSlot) + OFF_MANAGER_SCENE);
-        if (scene == nullptr) return;
+        if (scene == nullptr) return skip("no active scene");
         auto* vtbl    = *reinterpret_cast<char***>(scene);
         char* rebuild = vtbl[OFF_SCENE_VTBL_REBUILD_PLAYER / sizeof(void*)];
-        if (std::memcmp(rebuild, FIELD_REBUILD_PLAYER_PREFIX, sizeof(FIELD_REBUILD_PLAYER_PREFIX)) != 0) return;
-        if (*reinterpret_cast<void**>(scene + OFF_FIELD_SCENE_PLAYER) == nullptr) return;
-        if (!isProtagonist(currentPlayer())) return;
+        if (std::memcmp(rebuild, FIELD_REBUILD_PLAYER_PREFIX, sizeof(FIELD_REBUILD_PLAYER_PREFIX)) != 0)
+        {
+            const auto* b = reinterpret_cast<const uint8_t*>(rebuild);
+            return skip(std::format("scene is not the field (rebuild slot RVA 0x{:X}: {:02X} {:02X} {:02X} {:02X} {:02X} "
+                                    "{:02X} {:02X} {:02X})",
+                                    static_cast<uint64_t>(rebuild - getBaseOffset()), b[0], b[1], b[2], b[3], b[4],
+                                    b[5], b[6], b[7]));
+        }
+        if (*reinterpret_cast<void**>(scene + OFF_FIELD_SCENE_PLAYER) == nullptr) return skip("no field player");
+        if (!isProtagonist(currentPlayer())) return skip("story character in control");
         reinterpret_cast<void (*)(char*)>(rebuild)(scene);
         log("field player rebuilt");
     }
